@@ -6,8 +6,8 @@ usage() {
 	echo "Searches files in DIRECTORY for SEARCHSTRING. Returns the number of matching files and lines."
 	echo ""
 	echo "Arguments:"
-	echo "  DIRECTORY	Directory to search in, recursively"
-	echo "  SEARCHSTRING    String to search for"
+	echo "  DIRECTORY        Directory to search in, recursively"
+	echo "  SEARCHSTRING     String to search for"
 	echo ""
 	exit 1
 }
