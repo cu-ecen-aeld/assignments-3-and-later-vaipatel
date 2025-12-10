@@ -10,10 +10,11 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define PORT          "9000"  // Port we will bind to
-#define BACKLOG       10      // Backlog for listen()
-#define RECV_BUF_SIZE 1024    // Receive buffer size
-#define DATA_FILE     "/var/tmp/aesdsocketdata" // Where receive data is appended
+#define PORT            "9000"  // Port we will bind to
+#define BACKLOG         10      // Backlog for listen()
+#define RECV_BUF_SIZE   1024    // Receive buffer size
+#define DATA_FILE       "/var/tmp/aesdsocketdata" // Where receive data is appended
+#define INIT_PACKET_CAP 128     // Initial capacity to reserve for 
 
 // Global state
 volatile sig_atomic_t exit_requested = 0;
@@ -21,6 +22,8 @@ volatile sig_atomic_t exit_requested = 0;
 // Function Prototypes
 int SetupServerSocket(void);
 void HandleClient(int client_fd);
+int AppendToPacketBuffer(char** packet_buf, size_t* packet_len, size_t* packet_cap,
+						 const char* src, size_t src_len, const char* logstr);
 int SendDataToClient(int client_fd);
 int Daemonize(int server_fd);
 int RegisterSignalHandler();
@@ -267,6 +270,7 @@ void HandleClient(int client_fd)
     char recv_buf[RECV_BUF_SIZE];
     char *packet_buf = NULL;
     size_t packet_len = 0;
+	size_t packet_cap = 0;
     int senderr = 0;
 
     while ( !exit_requested && !senderr )
@@ -290,70 +294,88 @@ void HandleClient(int client_fd)
             // Client closed connection
             break;
         }
-
-        // Read recv_buf byte by byte
+		
+		size_t start = 0;
+		
+        // Parse recv_buf into packets
         for ( ssize_t i = 0;
               i < num_bytes && !exit_requested && !senderr;
               i++ )
         {
-            char c = recv_buf[i];
-
-            // Grow buffer by 1
-            char* new_buf = realloc(packet_buf, packet_len + 1);
-            if ( new_buf == NULL )
-            {
-                syslog(LOG_ERR, "realloc failed while building packet, discarding packet");
-                free(packet_buf);
-                packet_buf = NULL;
-                packet_len = 0;
-                close(data_fd);
-                return;
-            }
-
-            packet_buf = new_buf;
-            packet_buf[packet_len] = c;
-            packet_len++;
-
-            // If we have a complete packet ..
-            if ( c == '\n' )
-            {
-                // .. write it to the data file ..
-                size_t total_written = 0;
-                while (total_written < packet_len)
-                {
-                    ssize_t w = write(data_fd,
-                                      packet_buf + total_written,
-                                      packet_len - total_written);
-                    if (w == -1)
+			// Handle complete packet
+			if ( recv_buf[i] == '\n' )
+			{
+				// Grow the packet buffer to the segment since the start.
+				// (The buffer already has any earlier segments from prev partials)
+				size_t segment_len = (size_t)(i + 1) - start;
+				if ( AppendToPacketBuffer(
+						&packet_buf,
+						&packet_len,
+						&packet_cap,
+						recv_buf + start,
+						segment_len,
+						"building complete packet") != 0
+				)
+				{
+					// Packet was discarded; skip bytes up to and including '\n'
+                    start = (size_t)i + 1;
+                    continue;
+				}
+				
+				// We have a complete packet! Write it to file.
+				size_t total_written = 0;
+				while ( total_written < packet_len )
+				{
+					ssize_t w = write(data_fd, packet_buf + total_written, packet_len - total_written);
+					if (w == -1)
                     {
                         if (errno == EINTR)
                         {
-                            continue; /* retry */
+                            // If the call was interrupted by a signal before any data was written, retry
+                            continue;
                         }
+						// Truly had an error
                         syslog(LOG_ERR, "Error writing to %s: %s", DATA_FILE, strerror(errno));
-                        break;
+                        break; // (just end up writing the partial file and fail the unit tests)
                     }
-                    total_written += (size_t)w;
-                }
-
-                // .. send file data to client ..
+					
+					total_written += (size_t)w;
+				}
+				
+				// Send file data to client
                 senderr = (SendDataToClient(client_fd) < 0);
-                
-                // .. reset for next packet ..
-                free(packet_buf);
-                packet_buf = NULL;
+				
+				// Reset packet_len for next packet, but the keep packet_buf at packet_cap.
                 packet_len = 0;
-            }
-            // wrote complete packet to data file and sent to client
+
+                // Next segment starts after this newline
+                start = (size_t)i + 1;
+			}
         }
-        // read recv_buf
+		
+		// Handle any trailing partial packet
+		if (!exit_requested && !senderr && start < (size_t)num_bytes)
+		{
+			// Grow the packet buffer and write the leftover bytes to it
+			size_t leftover_len = (size_t)num_bytes - start;
+			if ( AppendToPacketBuffer(
+					&packet_buf,
+					&packet_len,
+					&packet_cap,
+					recv_buf + start,
+					leftover_len,
+					"buffering partial packet") != 0 )
+			{
+				// Partial packet discarded
+				continue;
+			}
+		}
     }
-    // done recv()ing
     
     // Cleanup
-    // If conn closed and we had a partial packet, discard it.
     free(packet_buf);
     packet_buf = NULL;
+	
     // Close data file
     if ( data_fd != -1 )
     {
@@ -362,6 +384,69 @@ void HandleClient(int client_fd)
             syslog(LOG_ERR, "Error closing %s: %s", DATA_FILE, strerror(errno));
         }
     }
+}
+
+/*
+ * Appends src, which could correspond to a partial packet segment, to packet_buf.
+ *
+ * packet_buf has capacity packet_cap, and is already currently filled upto packet_len.
+ * If more capacity is needed to fit src, this function will grow packet_buf. It will
+ * first try to grow it geometrically. Failing that it will fallback to growing exactly.
+ * After growing packet_buf, packet_len and packet_cap will all be updated.
+ *
+ * log_str is for custom error logging context (and usage context when encountering a
+ * call to this function).
+ *
+ * Returns 0 on success, -1 on failure in which case the packet_buf is discarded.
+ */
+int AppendToPacketBuffer(
+	char** packet_buf,
+	size_t* packet_len,
+	size_t* packet_cap,
+	const char* src,
+	size_t src_len,
+	const char* logstr
+)
+{
+	size_t needed = *packet_len + src_len;
+	if ( needed > *packet_cap )
+	{
+		size_t new_cap = (*packet_cap != 0) ? *packet_cap : INIT_PACKET_CAP;
+		while ( new_cap < needed )
+		{
+			new_cap *= 2;
+		}
+	
+		// Try reallocating the packet buffer to new_cap bytes
+		char* new_buf = realloc(*packet_buf, new_cap);
+		if ( new_buf == NULL )
+		{
+			// Could be that new_cap was too much for the system,
+			// but needed bytes might still fit? Fallback to needed.
+			new_buf = realloc(*packet_buf, needed);
+			if ( new_buf == NULL )
+			{
+				syslog(LOG_ERR,
+                       "realloc failed in %s for size %zu, discarding current packet",
+                       logstr, new_cap);
+				free(*packet_buf);
+				*packet_buf = NULL;
+				*packet_len = 0;
+				*packet_cap = 0;
+				return -1;
+			}
+		}
+		
+		// Point to the grown buffer and capacity
+		*packet_buf = new_buf;
+		*packet_cap = new_cap;
+	}
+	
+	// Copy src into packet_buf
+	memcpy(*packet_buf + *packet_len, src, src_len);
+    *packet_len += src_len;
+	
+	return 0;
 }
 
 /*
