@@ -423,7 +423,8 @@ int AppendToPacketBuffer(
 		{
 			// Could be that new_cap was too much for the system,
 			// but needed bytes might still fit? Fallback to needed.
-			new_buf = realloc(*packet_buf, needed);
+			new_cap = needed;
+			new_buf = realloc(*packet_buf, new_cap);
 			if ( new_buf == NULL )
 			{
 				syslog(LOG_ERR,
